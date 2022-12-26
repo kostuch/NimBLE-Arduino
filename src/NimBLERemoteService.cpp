@@ -163,6 +163,71 @@ std::vector<NimBLERemoteCharacteristic*>* NimBLERemoteService::getCharacteristic
     return &m_characteristicVector;
 } // getCharacteristics
 
+/**
+ * @brief Get the remote characteristic object for the characteristic UUID.
+ * @param [in] uuid Remote characteristic uuid.
+ * @param [in] ch_handle Remote characteristic handle.
+ * @return A pointer to the remote characteristic object.
+ */
+NimBLERemoteCharacteristic* NimBLERemoteService::getCharacteristic(const char* uuid, uint16_t ch_handle) {
+    return getCharacteristic(NimBLEUUID(uuid), ch_handle);
+} // getCharacteristic
+
+
+/**
+ * @brief Get the characteristic object for the UUID.
+ * @param [in] uuid Characteristic uuid.
+ * @param [in] ch_handle Remote characteristic handle.
+ * @return A pointer to the characteristic object, or nullptr if not found.
+ */
+NimBLERemoteCharacteristic* NimBLERemoteService::getCharacteristic(const NimBLEUUID &uuid, uint16_t ch_handle) {
+    NIMBLE_LOGD(LOG_TAG, ">> getCharacteristic: uuid: %s handle: %d", uuid.toString().c_str(), ch_handle);
+
+    for(auto &it: m_characteristicVector) {
+        NIMBLE_LOGD(LOG_TAG, "!!! %d", it->getHandle());
+				if((it->getUUID() == uuid) && (it->getHandle() == ch_handle)) {
+            NIMBLE_LOGD(LOG_TAG, "<< getCharacteristic: found the characteristic with uuid: %s handle: %d", uuid.toString().c_str(), ch_handle);
+            return it;
+        }
+    }
+
+    size_t prev_size = m_characteristicVector.size();
+    if(retrieveCharacteristics(ch_handle, &uuid)) {
+        if(m_characteristicVector.size() > prev_size) {
+            return m_characteristicVector.back();
+        }
+
+        // If the request was successful but 16/32 bit uuid not found
+        // try again with the 128 bit uuid.
+        if(uuid.bitSize() == BLE_UUID_TYPE_16 ||
+           uuid.bitSize() == BLE_UUID_TYPE_32)
+        {
+            NimBLEUUID uuid128(uuid);
+            uuid128.to128();
+            if (retrieveCharacteristics(ch_handle, &uuid128)) {
+                if(m_characteristicVector.size() > prev_size) {
+                    return m_characteristicVector.back();
+                }
+            }
+        } else {
+            // If the request was successful but the 128 bit uuid not found
+            // try again with the 16 bit uuid.
+            NimBLEUUID uuid16(uuid);
+            uuid16.to16();
+            // if the uuid was 128 bit but not of the BLE base type this check will fail
+            if (uuid16.bitSize() == BLE_UUID_TYPE_16) {
+                if(retrieveCharacteristics(ch_handle, &uuid16)) {
+                    if(m_characteristicVector.size() > prev_size) {
+                        return m_characteristicVector.back();
+                    }
+                }
+            }
+        }
+    }
+
+    NIMBLE_LOGD(LOG_TAG, "<< getCharacteristic: not found");
+    return nullptr;
+} // getCharacteristic
 
 /**
  * @brief Callback for Characteristic discovery.
@@ -270,6 +335,64 @@ bool NimBLERemoteService::retrieveCharacteristics(const NimBLEUUID *uuid_filter)
 
 } // retrieveCharacteristics
 
+bool NimBLERemoteService::retrieveCharacteristics(uint16_t ch_handle, const NimBLEUUID *uuid_filter) {
+    NIMBLE_LOGD(LOG_TAG, ">> retrieveCharacteristics() for service: %s handle: %d", getUUID().toString().c_str(), ch_handle);
+
+    int rc = 0;
+    TaskHandle_t cur_task = xTaskGetCurrentTaskHandle();
+    ble_task_data_t taskData = {this, cur_task, 0, nullptr};
+
+    if(uuid_filter == nullptr) {
+        rc = ble_gattc_disc_all_chrs(m_pClient->getConnId(),
+                             m_startHandle,
+                             ch_handle,
+                             NimBLERemoteService::characteristicDiscCB,
+                             &taskData);
+    } else {
+        rc = ble_gattc_disc_chrs_by_uuid(m_pClient->getConnId(),
+                             m_startHandle,
+                             ch_handle,
+                             &uuid_filter->getNative()->u,
+                             NimBLERemoteService::characteristicDiscCB,
+                             &taskData);
+    }
+
+    if (rc != 0) {
+        NIMBLE_LOGE(LOG_TAG, "ble_gattc_disc_all_chrs: rc=%d %s", rc, NimBLEUtils::returnCodeToString(rc));
+        return false;
+    }
+
+#ifdef ulTaskNotifyValueClear
+    // Clear the task notification value to ensure we block
+    ulTaskNotifyValueClear(cur_task, ULONG_MAX);
+#endif
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if(taskData.rc == 0){
+        if (uuid_filter == nullptr) {
+            if (m_characteristicVector.size() > 1) {
+                for (auto it = m_characteristicVector.begin(); it != m_characteristicVector.end(); ++it ) {
+                    auto nx = std::next(it, 1);
+                    if (nx == m_characteristicVector.end()) {
+                        break;
+                    }
+                    (*it)->m_endHandle = (*nx)->m_defHandle - 1;
+                }
+            }
+
+            if (m_characteristicVector.size() > 0) {
+                m_characteristicVector.back()->m_endHandle = getEndHandle();
+            }
+        }
+
+        NIMBLE_LOGD(LOG_TAG, "<< retrieveCharacteristics()");
+        return true;
+    }
+
+    NIMBLE_LOGE(LOG_TAG, "Could not retrieve characteristics");
+    return false;
+
+} // retrieveCharacteristics
 
 /**
  * @brief Get the client associated with this service.
